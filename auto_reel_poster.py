@@ -319,27 +319,42 @@ async def render_item(item: dict, output_mp4: str):
 def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
     if not ACCESS_TOKEN:
         raise RuntimeError("Missing IG_ACCESS_TOKEN!")
-    print(f"Uploading {mp4_path} to @loveunlimitedchats...")
-    with open(mp4_path, "rb") as f:
-        up = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": f}, timeout=120).json()
-    raw_url = up["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    file_size = os.path.getsize(mp4_path)
+    print(f"Initializing Direct Meta Resumable Upload for {mp4_path} ({file_size} bytes)...")
 
-    r = requests.post(
+    init_res = requests.post(
         f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
         data={
             "media_type": "REELS",
-            "video_url": raw_url,
+            "upload_type": "resumable",
             "caption": caption,
-            "thumb_offset": int(thumb_offset_ms),
             "share_to_feed": "true",
             "access_token": ACCESS_TOKEN,
         },
         timeout=60,
     ).json()
-    if "id" not in r:
-        raise RuntimeError(f"Failed to create IG media container: {r}")
-    cid = r["id"]
-    print(f"Created IG container {cid}, waiting for FINISHED status...")
+    if "id" not in init_res:
+        raise RuntimeError(f"Failed to initialize IG resumable container: {init_res}")
+
+    cid = init_res["id"]
+    upload_uri = init_res.get("uri", f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}")
+    print(f"Created IG container {cid}. Uploading binary MP4 directly to Meta ({upload_uri})...")
+
+    with open(mp4_path, "rb") as f:
+        video_bytes = f.read()
+
+    up_res = requests.post(
+        upload_uri,
+        headers={
+            "Authorization": f"OAuth {ACCESS_TOKEN}",
+            "offset": "0",
+            "file_size": str(file_size),
+            "Content-Type": "application/octet-stream",
+        },
+        data=video_bytes,
+        timeout=120,
+    ).json()
+    print("Direct binary upload response:", up_res)
 
     for attempt in range(1, 37):
         time.sleep(5)
@@ -349,9 +364,9 @@ def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
             timeout=30,
         ).json()
         sc = st.get("status_code", "")
-        print(f"  Poll {attempt}/36 -> status_code: {sc}")
+        print(f"  Poll {attempt}/36 -> status_code: {sc} ({st.get('status', '')})")
         if sc == "FINISHED":
-            time.sleep(4)
+            time.sleep(3)
             break
         if sc in ("ERROR", "EXPIRED"):
             raise RuntimeError(f"IG media processing failed: {st}")
@@ -367,13 +382,13 @@ def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
         if "id" in pub:
             print("PUBLISHED REEL:", pub)
             return pub
-        err_code = pub.get("error", {}).get("code")
-        if err_code == 9007:
-            print(f"  IG still finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
+        if pub.get("error", {}).get("code") == 9007:
+            print(f"  IG finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
             time.sleep(8)
             continue
         raise RuntimeError(f"IG publish failed: {pub}")
     raise RuntimeError("Exhausted retries waiting for Code 9007 to clear.")
+
 
 
 async def main():
