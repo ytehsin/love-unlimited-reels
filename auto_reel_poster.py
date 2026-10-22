@@ -367,7 +367,15 @@ async def main():
     with open(QUEUE_FILE, "r", encoding="utf-8") as f:
         queue = json.load(f)
 
-    next_item = next((x for x in queue if not x.get("posted")), None)
+    live_captions = ""
+    if IG_ACCESS_TOKEN:
+        try:
+            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption", "limit": 100, "access_token": IG_ACCESS_TOKEN}).json()
+            live_captions = " ".join([m.get("caption", "") for m in r_m.get("data", [])])
+            print(f"Checked {len(r_m.get('data', []))} live IG posts for deduplication.")
+        except Exception as e:
+            print("IG check warning:", e)
+    next_item = next((x for x in queue if not x.get("posted") and x["messages"][0]["text"] not in live_captions), None)
     if not next_item:
         print("All 500 Reels have been posted!")
         return
