@@ -2,14 +2,14 @@
 
 on:
   schedule:
-    # Off-peak UTC cron minutes (guaranteed fast execution in IST):
+    # Off-peak UTC cron minutes (IST = UTC + 5:30):
     # 03:37 UTC = 9:07 AM IST
-    # 07:47 UTC = 1:17 PM IST (Next automatic slot today!)
+    # 07:58 UTC = 1:28 PM IST (Next automatic run today!)
     # 10:37 UTC = 4:07 PM IST
     # 14:07 UTC = 7:37 PM IST
     # 17:07 UTC = 10:37 PM IST
     - cron: '37 3,10 * * *'
-    - cron: '47 7 * * *'
+    - cron: '58 7 * * *'
     - cron: '7 14,17 * * *'
   workflow_dispatch:
 
