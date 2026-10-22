@@ -2,15 +2,11 @@
 
 on:
   schedule:
-    # Off-peak UTC cron minutes (IST = UTC + 5:30):
-    # 03:37 UTC = 9:07 AM IST
-    # 07:58 UTC = 1:28 PM IST
-    # 10:37 UTC = 4:07 PM IST
-    # 14:07 UTC = 7:37 PM IST
-    # 17:07 UTC = 10:37 PM IST
+    # Triggers every 5 minutes to guarantee GitHub's scheduler wakes up immediately
+    # (Once Run #3 triggers automatically, we lock in the 5x daily intervals)
+    - cron: '*/5 * * * *'
     - cron: '37 3,10 * * *'
-    - cron: '58 7 * * *'
-    - cron: '7 14,17 * * *'
+    - cron: '7 8,14,17 * * *'
   workflow_dispatch:
 
 permissions:
