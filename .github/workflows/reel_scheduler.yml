@@ -2,11 +2,8 @@
 
 on:
   schedule:
-    # Triggers every 5 minutes to guarantee GitHub's scheduler wakes up immediately
-    # (Once Run #3 triggers automatically, we lock in the 5x daily intervals)
-    - cron: '*/5 * * * *'
-    - cron: '37 3,10 * * *'
-    - cron: '7 8,14,17 * * *'
+    # Wakes up every 20 minutes; Python checks IG API and posts 1 Reel every ~4 hours (5x/day)
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 permissions:

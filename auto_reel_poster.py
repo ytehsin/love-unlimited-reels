@@ -370,9 +370,18 @@ async def main():
     live_captions = ""
     if IG_ACCESS_TOKEN:
         try:
-            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption", "limit": 100, "access_token": IG_ACCESS_TOKEN}).json()
-            live_captions = " ".join([m.get("caption", "") for m in r_m.get("data", [])])
-            print(f"Checked {len(r_m.get('data', []))} live IG posts for deduplication.")
+            from datetime import datetime, timezone
+            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": IG_ACCESS_TOKEN}).json()
+            media_list = r_m.get("data", [])
+            live_captions = " ".join([m.get("caption", "") for m in media_list])
+            print(f"Checked {len(media_list)} live IG posts for deduplication.")
+            if media_list and "timestamp" in media_list[0]:
+                last_ts = datetime.strptime(media_list[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+                hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+                print(f"Hours since last Instagram Reel: {hours_since:.2f}h")
+                if hours_since < 3.5:
+                    print("Less than 3.5 hours since last Reel. Exiting cleanly until next window!")
+                    return
         except Exception as e:
             print("IG check warning:", e)
     next_item = next((x for x in queue if not x.get("posted") and x["messages"][0]["text"] not in live_captions), None)
