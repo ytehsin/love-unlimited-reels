@@ -316,52 +316,65 @@ async def render_item(item: dict, output_mp4: str):
 
     return int(max(1000, (elapsed - 1.0) * 1000))
 
-def publish_to_ig(mp4_path: str, caption: str, thumb_ms: int):
-    file_size = os.path.getsize(mp4_path)
-    init_res = requests.post(
-        f"{GRAPH_URL}/{IG_USER_ID}/media",
+def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
+    if not ACCESS_TOKEN:
+        raise RuntimeError("Missing IG_ACCESS_TOKEN!")
+    print(f"Uploading {mp4_path} to @loveunlimitedchats...")
+    with open(mp4_path, "rb") as f:
+        up = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": f}, timeout=120).json()
+    raw_url = up["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+    r = requests.post(
+        f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
         data={
             "media_type": "REELS",
-            "upload_type": "resumable",
+            "video_url": raw_url,
             "caption": caption,
+            "thumb_offset": int(thumb_offset_ms),
             "share_to_feed": "true",
-            "thumb_offset": str(thumb_ms),
-            "access_token": ACCESS_TOKEN
-        }
+            "access_token": ACCESS_TOKEN,
+        },
+        timeout=60,
     ).json()
+    if "id" not in r:
+        raise RuntimeError(f"Failed to create IG media container: {r}")
+    cid = r["id"]
+    print(f"Created IG container {cid}, waiting for FINISHED status...")
 
-    if "id" not in init_res or "uri" not in init_res:
-        raise Exception(f"Container init failed: {init_res}")
-
-    creation_id = init_res["id"]
-    with open(mp4_path, "rb") as vf:
-        up_res = requests.post(
-            init_res["uri"],
-            headers={
-                "Authorization": f"OAuth {ACCESS_TOKEN}",
-                "offset": "0",
-                "file_size": str(file_size),
-                "Content-Type": "application/octet-stream"
-            },
-            data=vf
-        ).json()
-
-    for _ in range(25):
+    for attempt in range(1, 37):
         time.sleep(5)
         st = requests.get(
-            f"{GRAPH_URL}/{creation_id}",
-            params={"fields": "status_code", "access_token": ACCESS_TOKEN}
+            f"https://graph.facebook.com/v21.0/{cid}",
+            params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
+            timeout=30,
         ).json()
-        if st.get("status_code") == "FINISHED":
+        sc = st.get("status_code", "")
+        print(f"  Poll {attempt}/36 -> status_code: {sc}")
+        if sc == "FINISHED":
+            time.sleep(4)
             break
-        elif st.get("status_code") in ("ERROR", "EXPIRED"):
-            raise Exception(f"Processing error: {st}")
+        if sc in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"IG media processing failed: {st}")
+    else:
+        raise RuntimeError("Timed out waiting for IG container to finish processing.")
 
-    pub_res = requests.post(
-        f"{GRAPH_URL}/{IG_USER_ID}/media_publish",
-        data={"creation_id": creation_id, "access_token": ACCESS_TOKEN}
-    ).json()
-    print("PUBLISHED REEL:", pub_res)
+    for pub_try in range(1, 9):
+        pub = requests.post(
+            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media_publish",
+            data={"creation_id": cid, "access_token": ACCESS_TOKEN},
+            timeout=60,
+        ).json()
+        if "id" in pub:
+            print("PUBLISHED REEL:", pub)
+            return pub
+        err_code = pub.get("error", {}).get("code")
+        if err_code == 9007:
+            print(f"  IG still finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
+            time.sleep(8)
+            continue
+        raise RuntimeError(f"IG publish failed: {pub}")
+    raise RuntimeError("Exhausted retries waiting for Code 9007 to clear.")
+
 
 async def main():
     with open(QUEUE_FILE, "r", encoding="utf-8") as f:
