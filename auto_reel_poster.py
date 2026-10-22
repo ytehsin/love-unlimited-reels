@@ -368,10 +368,10 @@ async def main():
         queue = json.load(f)
 
     live_captions = ""
-    if IG_ACCESS_TOKEN:
+    if ACCESS_TOKEN:
         try:
             from datetime import datetime, timezone
-            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": IG_ACCESS_TOKEN}).json()
+            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": ACCESS_TOKEN}).json()
             media_list = r_m.get("data", [])
             live_captions = " ".join([m.get("caption", "") for m in media_list])
             print(f"Checked {len(media_list)} live IG posts for deduplication.")
