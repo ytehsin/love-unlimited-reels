@@ -2,9 +2,12 @@ name: 5x Daily Automated Instagram Reel Poster
 
 on:
   schedule:
-    # Wakes up every 20 minutes; Python checks IG API and posts 1 Reel every ~4 hours (5x/day)
-    - cron: '*/20 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: ig-reel-poster
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -12,6 +15,7 @@ permissions:
 jobs:
   post-next-reel:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,18 +25,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg, Color Emojis, & Playwright Chromium
+      - name: Install Emoji Font & Playwright Chromium (Zero apt-get)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-color-emoji
-          pip install playwright requests
-          playwright install --with-deps chromium
+          mkdir -p ~/.local/share/fonts
+          curl -sL https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf -o ~/.local/share/fonts/NotoColorEmoji.ttf
+          fc-cache -f ~/.local/share/fonts
+          pip install -q playwright requests
+          playwright install chromium
 
       - name: Render & Publish Next Reel
         env:
           IG_USER_ID: "17841435829048294"
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-        run: python auto_reel_poster.py --publish
+        run: python -u auto_reel_poster.py --publish
 
       - name: Save updated queue.json
         run: |

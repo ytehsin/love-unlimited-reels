@@ -316,12 +316,131 @@ async def render_item(item: dict, output_mp4: str):
 
     return int(max(1000, (elapsed - 1.0) * 1000))
 
+def _ensure_ig_compliant_mp4(mp4_path):
+    """Mixes a continuous soft warm audio bed & enforces H.264/AAC faststart so IG never throws 2207082."""
+    import subprocess
+    fixed_path = "IG_READY_REEL.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", mp4_path,
+        "-f", "lavfi", "-i", "anoisesrc=color=pink:r=44100:a=0.015",
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,volume=1.0[aout]",
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-profile:v", "high", "-level:v", "4.1",
+        "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        fixed_path
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 10000:
+        print(f"Normalized MP4 with continuous audio bed for IG compliance ({os.path.getsize(fixed_path)} bytes).")
+        return fixed_path
+    return mp4_path
+
+def _poll_and_publish(cid):
+    for attempt in range(1, 37):
+        time.sleep(5)
+        st = requests.get(
+            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
+            params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
+            timeout=30,
+        ).json() if False else requests.get(
+            f"https://graph.facebook.com/v21.0/{cid}",
+            params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
+            timeout=30,
+        ).json()
+        sc = st.get("status_code", "")
+        print(f"  Poll {attempt}/36 -> status_code: {sc} ({st.get('status', '')})")
+        if sc == "FINISHED":
+            time.sleep(3)
+            break
+        if sc in ("ERROR", "EXPIRED"):
+            return None, st
+    else:
+        return None, {"error": "Timeout waiting for FINISHED"}
+
+    for pub_try in range(1, 9):
+        pub = requests.post(
+            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media_publish",
+            data={"creation_id": cid, "access_token": ACCESS_TOKEN},
+            timeout=60,
+        ).json()
+        if "id" in pub:
+            print("PUBLISHED REEL:", pub)
+            return pub, None
+        if pub.get("error", {}).get("code") == 9007:
+            print(f"  IG finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
+            time.sleep(8)
+            continue
+        return None, pub
+    return None, {"error": "Exhausted Code 9007 retries"}
+
 def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
     if not ACCESS_TOKEN:
         raise RuntimeError("Missing IG_ACCESS_TOKEN!")
+    mp4_path = _ensure_ig_compliant_mp4(mp4_path)
     file_size = os.path.getsize(mp4_path)
-    print(f"Initializing Direct Meta Resumable Upload for {mp4_path} ({file_size} bytes)...")
 
+    # Strategy 1: Direct HTTPS .mp4 URL hosts (catbox.moe & litterbox & forced-HTTPS tmpfiles)
+    hosts = []
+    try:
+        with open(mp4_path, "rb") as f:
+            r_cb = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": ("reel.mp4", f, "video/mp4")},
+                timeout=120,
+            )
+        if r_cb.status_code == 200 and r_cb.text.strip().startswith("https://"):
+            hosts.append(r_cb.text.strip())
+    except Exception as e:
+        print("  catbox warning:", e)
+
+    try:
+        with open(mp4_path, "rb") as f:
+            r_lb = requests.post(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": "1h"},
+                files={"fileToUpload": ("reel.mp4", f, "video/mp4")},
+                timeout=120,
+            )
+        if r_lb.status_code == 200 and r_lb.text.strip().startswith("https://"):
+            hosts.append(r_lb.text.strip())
+    except Exception as e:
+        print("  litterbox warning:", e)
+
+    try:
+        with open(mp4_path, "rb") as f:
+            up = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": ("reel.mp4", f, "video/mp4")}, timeout=120).json()
+        u = up["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/").replace("http://", "https://")
+        hosts.append(u)
+    except Exception as e:
+        print("  tmpfiles warning:", e)
+
+    for idx, video_url in enumerate(hosts, 1):
+        print(f"[Attempt {idx}] Creating IG container via HTTPS MP4 URL: {video_url}")
+        r = requests.post(
+            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
+            data={
+                "media_type": "REELS",
+                "video_url": video_url,
+                "caption": caption,
+                "share_to_feed": "true",
+                "access_token": ACCESS_TOKEN,
+            },
+            timeout=60,
+        ).json()
+        if "id" not in r:
+            print("  Container init failed:", r)
+            continue
+        pub, err = _poll_and_publish(r["id"])
+        if pub:
+            return pub
+        print(f"  Attempt {idx} failed with: {err}")
+
+    # Fallback: Direct Meta Resumable Binary Upload (rupload.facebook.com)
+    print(f"[Fallback] Direct Meta Resumable Upload ({file_size} bytes)...")
     init_res = requests.post(
         f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
         data={
@@ -333,61 +452,30 @@ def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
         },
         timeout=60,
     ).json()
-    if "id" not in init_res:
-        raise RuntimeError(f"Failed to initialize IG resumable container: {init_res}")
-
-    cid = init_res["id"]
-    upload_uri = init_res.get("uri", f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}")
-    print(f"Created IG container {cid}. Uploading binary MP4 directly to Meta ({upload_uri})...")
-
-    with open(mp4_path, "rb") as f:
-        video_bytes = f.read()
-
-    up_res = requests.post(
-        upload_uri,
-        headers={
-            "Authorization": f"OAuth {ACCESS_TOKEN}",
-            "offset": "0",
-            "file_size": str(file_size),
-            "Content-Type": "application/octet-stream",
-        },
-        data=video_bytes,
-        timeout=120,
-    ).json()
-    print("Direct binary upload response:", up_res)
-
-    for attempt in range(1, 37):
-        time.sleep(5)
-        st = requests.get(
-            f"https://graph.facebook.com/v21.0/{cid}",
-            params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
-            timeout=30,
+    if "id" in init_res:
+        cid = init_res["id"]
+        upload_uri = init_res.get("uri", f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}")
+        with open(mp4_path, "rb") as f:
+            video_bytes = f.read()
+        up_res = requests.post(
+            upload_uri,
+            headers={
+                "Authorization": f"OAuth {ACCESS_TOKEN}",
+                "offset": "0",
+                "file_size": str(file_size),
+                "Content-Type": "application/octet-stream",
+            },
+            data=video_bytes,
+            timeout=120,
         ).json()
-        sc = st.get("status_code", "")
-        print(f"  Poll {attempt}/36 -> status_code: {sc} ({st.get('status', '')})")
-        if sc == "FINISHED":
-            time.sleep(3)
-            break
-        if sc in ("ERROR", "EXPIRED"):
-            raise RuntimeError(f"IG media processing failed: {st}")
-    else:
-        raise RuntimeError("Timed out waiting for IG container to finish processing.")
-
-    for pub_try in range(1, 9):
-        pub = requests.post(
-            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media_publish",
-            data={"creation_id": cid, "access_token": ACCESS_TOKEN},
-            timeout=60,
-        ).json()
-        if "id" in pub:
-            print("PUBLISHED REEL:", pub)
+        print("  rupload response:", up_res)
+        pub, err = _poll_and_publish(cid)
+        if pub:
             return pub
-        if pub.get("error", {}).get("code") == 9007:
-            print(f"  IG finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
-            time.sleep(8)
-            continue
-        raise RuntimeError(f"IG publish failed: {pub}")
-    raise RuntimeError("Exhausted retries waiting for Code 9007 to clear.")
+        raise RuntimeError(f"Direct upload failed: {err}")
+
+    raise RuntimeError("All IG upload strategies failed!")
+
 
 
 
