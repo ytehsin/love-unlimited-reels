@@ -504,7 +504,6 @@ def select_next_reel(queue, live_captions_norm):
         if x.get("posted"):
             continue
         norm_c = _norm_caption(x.get("caption", ""))
-        # Only auto-mark as already posted if this caption is unique in the 500-item queue AND live on IG
         if norm_c and cap_counts[norm_c] == 1 and norm_c in live_captions_norm:
             print(f"Reel #{x.get('id')} unique caption already found on live IG feed; marking posted=True.")
             x["posted"] = True
@@ -517,8 +516,7 @@ def select_next_reel(queue, live_captions_norm):
 
 def save_queue_atomic(queue, path="queue.json"):
     tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8", newline="
-") as f:
+    with open(tmp_path, "w", encoding="utf-8", newline=chr(10)) as f:
         json.dump(queue, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
 
@@ -526,7 +524,6 @@ def save_queue_atomic(queue, path="queue.json"):
 def run_self_test():
     """Executes offline unit and integrity checks on queue.json, deduplication, and token redaction."""
     print("=== RUNNING AUTOMATED SELF-TEST SUITE ===")
-    # Test 1: queue.json validity & state
     with open("queue.json", "r", encoding="utf-8") as f:
         q = json.load(f)
     assert isinstance(q, list) and len(q) >= 6, "Test 1 Failed: queue.json invalid"
@@ -537,7 +534,6 @@ def run_self_test():
     assert nxt and nxt["id"] == 6, f"Test 1 Failed: Expected Reel #6 next, got {nxt['id'] if nxt else None}"
     print("[PASS] Test 1: queue.json integrity & Reel #6 queued next (Reels 1..5 marked posted)")
 
-    # Test 2: Substring trap immunity (short message "Hi" must NOT skip unposted Reel)
     mock_q = [
         {"id": 10, "posted": False, "caption": "Unique Hook A #love", "messages": [{"text": "Hi"}]},
         {"id": 11, "posted": False, "caption": "Shared Hook #love", "messages": [{"text": "Ok"}]},
@@ -548,14 +544,12 @@ def run_self_test():
     assert picked and picked["id"] == 10, "Test 2 Failed: Short message substring falsely skipped Reel #10"
     print("[PASS] Test 2: Substring collision immunity verified")
 
-    # Test 3: Unique live caption auto-reconciliation vs shared caption preservation
     live_set_2 = {_norm_caption("Unique Hook A #love"), _norm_caption("Shared Hook #love")}
     picked_2, mod_2 = select_next_reel(mock_q, live_set_2)
     assert mod_2 is True and mock_q[0]["posted"] is True, "Test 3 Failed: Unique live caption was not reconciled"
     assert picked_2 and picked_2["id"] == 11, "Test 3 Failed: Shared caption falsely skipped Reel #11"
     print("[PASS] Test 3: Unique vs. shared caption deduplication verified")
 
-    # Test 4: Atomic queue save
     save_queue_atomic(q, "queue.json")
     print("[PASS] Test 4: Atomic queue.json write verified")
     print("=== ALL SELF-TESTS PASSED SUCCESSFULLY ===")
@@ -570,10 +564,8 @@ async def main():
         should_post = check_pacing_gate_stdlib(3.5)
         gh_out = os.environ.get("GITHUB_OUTPUT")
         if gh_out:
-            with open(gh_out, "a", encoding="utf-8", newline="
-") as f:
-                f.write(f"should_post={'true' if should_post else 'false'}
-")
+            with open(gh_out, "a", encoding="utf-8", newline=chr(10)) as f:
+                print(f"should_post={'true' if should_post else 'false'}", file=f)
         return
 
     with open("queue.json", "r", encoding="utf-8") as f:
