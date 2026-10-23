@@ -34,16 +34,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Check 3.5-Hour Instagram Pacing Gate (Fast Stdlib Check)
-        id: gate
-        env:
-          IG_USER_ID: "17841435829048294"
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          FORCE_PUBLISH: ${{ inputs.force_publish || 'false' }}
-        run: python -u auto_reel_poster.py --check-gate
-
-      - name: Install Emoji Font & Playwright Chromium
-        if: steps.gate.outputs.should_post == 'true'
+      - name: Install Emoji Font & Playwright Chromium (Zero apt-get)
         run: |
           mkdir -p ~/.local/share/fonts
           curl -sL --retry 3 https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf -o ~/.local/share/fonts/NotoColorEmoji.ttf
@@ -52,7 +43,6 @@ jobs:
           playwright install chromium
 
       - name: Render & Publish Next Reel
-        if: steps.gate.outputs.should_post == 'true'
         env:
           IG_USER_ID: "17841435829048294"
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
@@ -60,7 +50,6 @@ jobs:
         run: python -u auto_reel_poster.py --publish
 
       - name: Save updated queue.json
-        if: steps.gate.outputs.should_post == 'true'
         run: |
           git config user.name "ytehsin"
           git config user.email "ytehsin@users.noreply.github.com"
