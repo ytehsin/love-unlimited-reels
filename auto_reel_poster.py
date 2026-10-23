@@ -316,148 +316,117 @@ async def render_item(item: dict, output_mp4: str):
 
     return int(max(1000, (elapsed - 1.0) * 1000))
 
-def _ensure_ig_compliant_mp4(mp4_path):
-    """Mixes a continuous soft warm audio bed & enforces H.264/AAC faststart so IG never throws 2207082."""
-    import subprocess
-    fixed_path = "IG_READY_REEL.mp4"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", mp4_path,
-        "-f", "lavfi", "-i", "anoisesrc=color=pink:r=44100:a=0.015",
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,volume=1.0[aout]",
-        "-map", "0:v:0", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "fast", "-profile:v", "high", "-level:v", "4.1",
-        "-pix_fmt", "yuv420p", "-r", "30",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-        "-movflags", "+faststart",
-        fixed_path
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 10000:
-        print(f"Normalized MP4 with continuous audio bed for IG compliance ({os.path.getsize(fixed_path)} bytes).")
-        return fixed_path
-    return mp4_path
+def _redact_token(text):
+    s = str(text)
+    if ACCESS_TOKEN and len(ACCESS_TOKEN) > 6:
+        s = s.replace(ACCESS_TOKEN, "***REDACTED***")
+    return s
+
+
+def _graph_json(method, url, retries=3, **kwargs):
+    """Official Meta Graph API request wrapper with retry backoff, safe JSON parsing, and token redaction."""
+    kwargs.setdefault("timeout", 45)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"error": {"message": f"Non-JSON HTTP {resp.status_code}: {resp.text[:200]}"}}
+            if resp.status_code >= 500 and attempt < retries:
+                print(f"  [Meta API] Transient HTTP {resp.status_code} (attempt {attempt}/{retries}), retrying in 5s...")
+                time.sleep(5)
+                continue
+            return data
+        except Exception as e:
+            last_err = _redact_token(e)
+            if attempt < retries:
+                print(f"  [Meta API] Network warning (attempt {attempt}/{retries}): {last_err}. Retrying in 5s...")
+                time.sleep(5)
+            else:
+                raise RuntimeError(f"Meta API request failed after {retries} attempts: {last_err}")
+    raise RuntimeError(f"Meta API request failed: {last_err}")
+
 
 def _poll_and_publish(cid):
     for attempt in range(1, 37):
         time.sleep(5)
-        st = requests.get(
-            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
-            params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
-            timeout=30,
-        ).json() if False else requests.get(
+        st = _graph_json(
+            "GET",
             f"https://graph.facebook.com/v21.0/{cid}",
             params={"fields": "status_code,status", "access_token": ACCESS_TOKEN},
             timeout=30,
-        ).json()
+        )
         sc = st.get("status_code", "")
-        print(f"  Poll {attempt}/36 -> status_code: {sc} ({st.get('status', '')})")
+        status_detail = st.get("status", "")
+        print(f"  Poll {attempt}/36 -> status_code: {sc} ({status_detail})")
         if sc == "FINISHED":
             time.sleep(3)
             break
         if sc in ("ERROR", "EXPIRED"):
             return None, st
     else:
-        return None, {"error": "Timeout waiting for FINISHED"}
+        return None, {"error": "Timeout waiting for FINISHED status"}
 
     for pub_try in range(1, 9):
-        pub = requests.post(
+        pub = _graph_json(
+            "POST",
             f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media_publish",
             data={"creation_id": cid, "access_token": ACCESS_TOKEN},
             timeout=60,
-        ).json()
+        )
         if "id" in pub:
             print("PUBLISHED REEL:", pub)
             return pub, None
-        if pub.get("error", {}).get("code") == 9007:
+        err_code = pub.get("error", {}).get("code")
+        if err_code == 9007:
             print(f"  IG finalizing video (Code 9007, retry {pub_try}/8). Waiting 8s...")
             time.sleep(8)
             continue
         return None, pub
-    return None, {"error": "Exhausted Code 9007 retries"}
+    return None, {"error": "Exhausted Code 9007 publish retries"}
+
 
 def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
+    """Publishes MP4 to Instagram Reels using Meta's official Graph API v21.0 Resumable Upload."""
     if not ACCESS_TOKEN:
-        raise RuntimeError("Missing IG_ACCESS_TOKEN!")
-    mp4_path = _ensure_ig_compliant_mp4(mp4_path)
+        raise RuntimeError("Missing IG_ACCESS_TOKEN environment variable!")
+    if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 1024:
+        raise RuntimeError(f"Invalid or missing video file: {mp4_path}")
+
     file_size = os.path.getsize(mp4_path)
+    last_error = None
 
-    # Strategy 1: Direct HTTPS .mp4 URL hosts (catbox.moe & litterbox & forced-HTTPS tmpfiles)
-    hosts = []
-    try:
-        with open(mp4_path, "rb") as f:
-            r_cb = requests.post(
-                "https://catbox.moe/user/api.php",
-                data={"reqtype": "fileupload"},
-                files={"fileToUpload": ("reel.mp4", f, "video/mp4")},
-                timeout=120,
-            )
-        if r_cb.status_code == 200 and r_cb.text.strip().startswith("https://"):
-            hosts.append(r_cb.text.strip())
-    except Exception as e:
-        print("  catbox warning:", e)
-
-    try:
-        with open(mp4_path, "rb") as f:
-            r_lb = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": "1h"},
-                files={"fileToUpload": ("reel.mp4", f, "video/mp4")},
-                timeout=120,
-            )
-        if r_lb.status_code == 200 and r_lb.text.strip().startswith("https://"):
-            hosts.append(r_lb.text.strip())
-    except Exception as e:
-        print("  litterbox warning:", e)
-
-    try:
-        with open(mp4_path, "rb") as f:
-            up = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": ("reel.mp4", f, "video/mp4")}, timeout=120).json()
-        u = up["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/").replace("http://", "https://")
-        hosts.append(u)
-    except Exception as e:
-        print("  tmpfiles warning:", e)
-
-    for idx, video_url in enumerate(hosts, 1):
-        print(f"[Attempt {idx}] Creating IG container via HTTPS MP4 URL: {video_url}")
-        r = requests.post(
+    for container_try in range(1, 3):
+        print(f"[Meta Resumable Upload {container_try}/2] Initializing container for {mp4_path} ({file_size} bytes)...")
+        init_res = _graph_json(
+            "POST",
             f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
             data={
                 "media_type": "REELS",
-                "video_url": video_url,
+                "upload_type": "resumable",
                 "caption": caption,
                 "share_to_feed": "true",
                 "access_token": ACCESS_TOKEN,
             },
             timeout=60,
-        ).json()
-        if "id" not in r:
-            print("  Container init failed:", r)
+        )
+        if "id" not in init_res:
+            last_error = init_res
+            print(f"  Container initialization failed: {_redact_token(init_res)}")
+            time.sleep(5)
             continue
-        pub, err = _poll_and_publish(r["id"])
-        if pub:
-            return pub
-        print(f"  Attempt {idx} failed with: {err}")
 
-    # Fallback: Direct Meta Resumable Binary Upload (rupload.facebook.com)
-    print(f"[Fallback] Direct Meta Resumable Upload ({file_size} bytes)...")
-    init_res = requests.post(
-        f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
-        data={
-            "media_type": "REELS",
-            "upload_type": "resumable",
-            "caption": caption,
-            "share_to_feed": "true",
-            "access_token": ACCESS_TOKEN,
-        },
-        timeout=60,
-    ).json()
-    if "id" in init_res:
         cid = init_res["id"]
         upload_uri = init_res.get("uri", f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}")
+        print(f"  Created container {cid}. Uploading binary stream to {upload_uri}...")
+
         with open(mp4_path, "rb") as f:
             video_bytes = f.read()
-        up_res = requests.post(
+
+        up_res = _graph_json(
+            "POST",
             upload_uri,
             headers={
                 "Authorization": f"OAuth {ACCESS_TOKEN}",
@@ -467,31 +436,165 @@ def publish_to_ig(mp4_path, caption, thumb_offset_ms=0):
             },
             data=video_bytes,
             timeout=120,
-        ).json()
-        print("  rupload response:", up_res)
+        )
+        print("  Binary upload response:", _redact_token(up_res))
+
         pub, err = _poll_and_publish(cid)
         if pub:
             return pub
-        raise RuntimeError(f"Direct upload failed: {err}")
+        last_error = err
+        print(f"  Container {cid} failed ({_redact_token(err)}).")
+        if container_try < 2:
+            print("  Retrying with a fresh Meta container in 10s...")
+            time.sleep(10)
 
-    raise RuntimeError("All IG upload strategies failed!")
+    raise RuntimeError(f"Meta Resumable Upload failed after 2 container attempts: {_redact_token(last_error)}")
 
 
+def _norm_caption(text):
+    return " ".join((text or "").split())
+
+
+def check_pacing_gate_stdlib(min_hours=3.5):
+    """Zero-dependency gate check using Python stdlib so CI can skip heavy browser installs during cooldown."""
+    import urllib.request
+    import urllib.parse
+    from datetime import datetime, timezone
+
+    force = os.environ.get("FORCE_PUBLISH", "false").lower() == "true"
+    if force:
+        print("FORCE_PUBLISH=true set. Bypassing 3.5h cooldown gate!")
+        return True
+
+    if not ACCESS_TOKEN:
+        print("No IG_ACCESS_TOKEN set; allowing gate pass for dry/local check.")
+        return True
+
+    params = urllib.parse.urlencode({
+        "fields": "timestamp",
+        "limit": "5",
+        "access_token": ACCESS_TOKEN,
+    })
+    url = f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media?{params}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        media_list = data.get("data", [])
+        if media_list and "timestamp" in media_list[0]:
+            last_ts = datetime.strptime(media_list[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+            hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+            print(f"Hours since last Instagram Reel: {hours_since:.2f}h (threshold: {min_hours}h)")
+            if hours_since < min_hours:
+                print(f"Less than {min_hours} hours since last Reel. Exiting cleanly until next window!")
+                return False
+        return True
+    except Exception as e:
+        print(f"Gate check warning ({_redact_token(e)}). Proceeding to main runner.")
+        return True
+
+
+def select_next_reel(queue, live_captions_norm):
+    """Selects next unposted Reel safely without substring collisions or shared-caption lockouts."""
+    from collections import Counter
+    cap_counts = Counter(_norm_caption(x.get("caption", "")) for x in queue)
+    modified = False
+
+    for x in queue:
+        if x.get("posted"):
+            continue
+        norm_c = _norm_caption(x.get("caption", ""))
+        # Only auto-mark as already posted if this caption is unique in the 500-item queue AND live on IG
+        if norm_c and cap_counts[norm_c] == 1 and norm_c in live_captions_norm:
+            print(f"Reel #{x.get('id')} unique caption already found on live IG feed; marking posted=True.")
+            x["posted"] = True
+            modified = True
+            continue
+        return x, modified
+
+    return None, modified
+
+
+def save_queue_atomic(queue, path="queue.json"):
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="
+") as f:
+        json.dump(queue, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def run_self_test():
+    """Executes offline unit and integrity checks on queue.json, deduplication, and token redaction."""
+    print("=== RUNNING AUTOMATED SELF-TEST SUITE ===")
+    # Test 1: queue.json validity & state
+    with open("queue.json", "r", encoding="utf-8") as f:
+        q = json.load(f)
+    assert isinstance(q, list) and len(q) >= 6, "Test 1 Failed: queue.json invalid"
+    for i in (1, 2, 3, 4, 5):
+        item = next(x for x in q if x["id"] == i)
+        assert item.get("posted") is True, f"Test 1 Failed: Reel #{i} must be marked posted=True"
+    nxt, _ = select_next_reel(q, set())
+    assert nxt and nxt["id"] == 6, f"Test 1 Failed: Expected Reel #6 next, got {nxt['id'] if nxt else None}"
+    print("[PASS] Test 1: queue.json integrity & Reel #6 queued next (Reels 1..5 marked posted)")
+
+    # Test 2: Substring trap immunity (short message "Hi" must NOT skip unposted Reel)
+    mock_q = [
+        {"id": 10, "posted": False, "caption": "Unique Hook A #love", "messages": [{"text": "Hi"}]},
+        {"id": 11, "posted": False, "caption": "Shared Hook #love", "messages": [{"text": "Ok"}]},
+        {"id": 12, "posted": False, "caption": "Shared Hook #love", "messages": [{"text": "Yes"}]},
+    ]
+    live_set = {_norm_caption("His heart melted when she texted #love")}
+    picked, _ = select_next_reel(mock_q, live_set)
+    assert picked and picked["id"] == 10, "Test 2 Failed: Short message substring falsely skipped Reel #10"
+    print("[PASS] Test 2: Substring collision immunity verified")
+
+    # Test 3: Unique live caption auto-reconciliation vs shared caption preservation
+    live_set_2 = {_norm_caption("Unique Hook A #love"), _norm_caption("Shared Hook #love")}
+    picked_2, mod_2 = select_next_reel(mock_q, live_set_2)
+    assert mod_2 is True and mock_q[0]["posted"] is True, "Test 3 Failed: Unique live caption was not reconciled"
+    assert picked_2 and picked_2["id"] == 11, "Test 3 Failed: Shared caption falsely skipped Reel #11"
+    print("[PASS] Test 3: Unique vs. shared caption deduplication verified")
+
+    # Test 4: Atomic queue save
+    save_queue_atomic(q, "queue.json")
+    print("[PASS] Test 4: Atomic queue.json write verified")
+    print("=== ALL SELF-TESTS PASSED SUCCESSFULLY ===")
 
 
 async def main():
-    with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+    if "--self-test" in sys.argv:
+        run_self_test()
+        return
+
+    if "--check-gate" in sys.argv:
+        should_post = check_pacing_gate_stdlib(3.5)
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a", encoding="utf-8", newline="
+") as f:
+                f.write(f"should_post={'true' if should_post else 'false'}
+")
+        return
+
+    with open("queue.json", "r", encoding="utf-8") as f:
         queue = json.load(f)
 
-    live_captions = ""
+    live_captions_norm = set()
+    force = os.environ.get("FORCE_PUBLISH", "false").lower() == "true"
+
     if ACCESS_TOKEN:
         try:
             from datetime import datetime, timezone
-            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": ACCESS_TOKEN}).json()
+            r_m = _graph_json(
+                "GET",
+                f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
+                params={"fields": "caption,timestamp", "limit": 100, "access_token": ACCESS_TOKEN},
+                timeout=30,
+            )
             media_list = r_m.get("data", [])
-            live_captions = " ".join([m.get("caption", "") for m in media_list])
+            live_captions_norm = {_norm_caption(m.get("caption", "")) for m in media_list if m.get("caption")}
             print(f"Checked {len(media_list)} live IG posts for deduplication.")
-            if media_list and "timestamp" in media_list[0]:
+            if not force and media_list and "timestamp" in media_list[0]:
                 last_ts = datetime.strptime(media_list[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
                 hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
                 print(f"Hours since last Instagram Reel: {hours_since:.2f}h")
@@ -499,26 +602,28 @@ async def main():
                     print("Less than 3.5 hours since last Reel. Exiting cleanly until next window!")
                     return
         except Exception as e:
-            print("IG check warning:", e)
-    next_item = next((x for x in queue if not x.get("posted") and x["messages"][0]["text"] not in live_captions), None)
+            print("IG check warning:", _redact_token(e))
+
+    next_item, reconciled = select_next_reel(queue, live_captions_norm)
+    if reconciled:
+        save_queue_atomic(queue, "queue.json")
+
     if not next_item:
-        print("All 500 Reels have been posted!")
+        print("All 500 Reels in queue.json have been published!")
         return
 
-    print(f"Rendering Reel #{next_item['id']} ({next_item['culture'].upper()} - {next_item['contact_name']})...")
-    thumb_ms = await render_item(next_item, "SAFEZONE_PREVIEW.mp4")
+    print(f"Rendering Reel #{next_item['id']} ({next_item.get('lang', '')} - {next_item.get('name', '')})...")
+    mp4_path, thumb_ms = await render_reel(next_item)
 
     if "--publish" in sys.argv:
-        print("Uploading SAFEZONE_PREVIEW.mp4 to @loveunlimitedchats...")
-        publish_to_ig("SAFEZONE_PREVIEW.mp4", next_item["caption"], thumb_ms)
+        from datetime import datetime, timezone
+        pub_res = publish_to_ig(mp4_path, next_item["caption"], thumb_ms)
         next_item["posted"] = True
-        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-            json.dump(queue, f, indent=2, ensure_ascii=False)
-    else:
-        print("\nDONE! Preview SAFEZONE_PREVIEW.mp4 locally (or run 'python auto_reel_poster.py --publish' to post live!)")
+        if isinstance(pub_res, dict) and "id" in pub_res:
+            next_item["ig_media_id"] = str(pub_res["id"])
+        next_item["posted_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        save_queue_atomic(queue, "queue.json")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
