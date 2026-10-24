@@ -412,7 +412,7 @@ async def main():
                     return
         except Exception as e:
             print("IG check warning:", e)
-    next_item = next((x for x in queue if not x.get("posted") and x["caption"].splitlines()[0].strip() not in live_captions), None)
+    next_item = next((x for x in queue if not x.get("posted")), None)
     if not next_item:
         print("All 500 Reels have been posted!")
         return
