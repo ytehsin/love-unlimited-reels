@@ -399,7 +399,7 @@ async def main():
     if ACCESS_TOKEN:
         try:
             from datetime import datetime, timezone
-            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": ACCESS_TOKEN}).json()
+            r_m = requests.get(f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media", params={"fields": "caption,timestamp", "limit": 100, "access_token": ACCESS_TOKEN}, timeout=30).json()
             media_list = r_m.get("data", [])
             live_captions = " ".join([m.get("caption", "") for m in media_list])
             print(f"Checked {len(media_list)} live IG posts for deduplication.")
@@ -412,7 +412,7 @@ async def main():
                     return
         except Exception as e:
             print("IG check warning:", e)
-    next_item = next((x for x in queue if not x.get("posted") and x["messages"][0]["text"] not in live_captions), None)
+    next_item = next((x for x in queue if not x.get("posted") and x["caption"].splitlines()[0].strip() not in live_captions), None)
     if not next_item:
         print("All 500 Reels have been posted!")
         return

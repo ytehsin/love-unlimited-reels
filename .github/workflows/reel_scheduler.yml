@@ -25,12 +25,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Emoji Font & Playwright Chromium (Zero apt-get)
+      - name: Install Static FFmpeg, Emoji Font & Playwright Chromium (Zero apt-get)
         run: |
           mkdir -p ~/.local/share/fonts
           curl -sL --retry 3 https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf -o ~/.local/share/fonts/NotoColorEmoji.ttf
           fc-cache -f ~/.local/share/fonts
-          pip install -q playwright requests
+          pip install -q playwright requests imageio-ffmpeg
+          sudo ln -sf "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" /usr/local/bin/ffmpeg
+          ffmpeg -version | head -n 1
           playwright install chromium
 
       - name: Render & Publish Next Reel
